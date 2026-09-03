@@ -1,0 +1,25 @@
+name: Test Product
+description: Run the Pester tests for a given product
+inputs:
+  Thumbprint:
+    required: true
+    description: "The certificate thumbprint"
+  Alias:
+    required: true
+    description: "The alias of the product being tested"
+  TestParams:
+    required: true
+    description: "The set of parameters used to defined the test"
+runs:
+  using: "composite"
+  steps:
+    - run: |
+        Import-Module -Name Selenium
+        cd repo
+
+        . utils/action/Test-Product.ps1
+        Test-Product `
+          -Thumbprint "${{ inputs.Thumbprint }}" `
+          -ProductAlias "${{ inputs.Alias }}" `
+          -TestParams "${{ inputs.TestParams }}"
+      shell: powershell

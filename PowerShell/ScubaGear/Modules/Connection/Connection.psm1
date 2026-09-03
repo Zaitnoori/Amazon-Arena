@@ -1,0 +1,308 @@
+function Connect-Tenant {
+    <#
+   .Description
+   This function uses the various PowerShell modules to establish
+   a connection to an M365 Tenant associated with provided
+   credentials
+   .Functionality
+   Internal
+   #>
+   [CmdletBinding(DefaultParameterSetName='Manual')]
+   param (
+   [Parameter(ParameterSetName = 'Auto')]
+   [Parameter(ParameterSetName = 'Manual')]
+   [Parameter(Mandatory = $true)]
+   [ValidateNotNullOrEmpty()]
+   [ValidateSet("teams", "exo", "defender", "aad", "powerplatform", "sharepoint", IgnoreCase = $false)]
+   [string[]]
+   $ProductNames,
+
+   [Parameter(ParameterSetName = 'Auto')]
+   [Parameter(ParameterSetName = 'Manual')]
+   [Parameter(Mandatory = $true)]
+   [ValidateNotNullOrEmpty()]
+   [ValidateSet("commercial", "gcc", "gcchigh", "dod", IgnoreCase = $false)]
+   [string]
+   $M365Environment,
+
+   [Parameter(ParameterSetName = 'Auto')]
+   [Parameter(Mandatory = $false)]
+   [AllowNull()]
+   [hashtable]
+   $ServicePrincipalParams
+   )
+   Import-Module (Join-Path -Path $PSScriptRoot -ChildPath "ConnectHelpers.psm1")
+   Import-Module -Name $PSScriptRoot/../Utility/Utility.psm1 -Function Invoke-GraphDirectly, ConvertFrom-GraphHashtable
+   Import-Module -Name $PSScriptRoot/../Utility/ScubaLogging.psm1 -Function Write-ScubaLog
+   Import-Module -Name $PSScriptRoot/../Providers/ProviderHelpers/PowerPlatformRestHelper.psm1 -Function Get-PowerPlatformBaseUrl, Get-PowerPlatformScope
+   Import-Module -Name $PSScriptRoot/../Providers/ProviderHelpers/SPORestHelper.psm1 -Function Get-SPOAdminUrl
+
+   # Prevent duplicate sign ins
+   $EXOAuthRequired = $true
+   $SPOAuthRequired = $true
+   $AADAuthRequired = $true
+
+   $ProdAuthFailed = @()
+
+   # Token data for REST-based products (populated during connection)
+   $TokenData = @{
+       SPOAccessToken  = $null
+       SPOAdminUrl     = $null
+       PPAccessToken   = $null
+       PPBaseUrl       = $null
+   }
+
+   $N = 0
+   $Len = $ProductNames.Length
+
+   foreach ($Product in $ProductNames) {
+       $N += 1
+       $Percent = $N*100/$Len
+       $ProgressParams = @{
+           'Activity' = "Authenticating to each Product";
+           'Status' = "Authenticating to $($Product); $($N) of $($Len) Products authenticated to.";
+           'PercentComplete' = $Percent;
+       }
+       Write-Progress @ProgressParams
+       try {
+           switch ($Product) {
+               "aad" {
+                   $GraphScopes = Get-ScubaGearEntraMinimumPermissions
+
+                   $GraphParams = @{
+                       'M365Environment' = $M365Environment;
+                       'Scopes' = $GraphScopes;
+                   }
+                   if($ServicePrincipalParams) {
+                    $GraphParams += @{ServicePrincipalParams = $ServicePrincipalParams}
+                   }
+                   Connect-GraphHelper @GraphParams
+                   $AADAuthRequired = $false
+               }
+               {($_ -eq "exo") -or ($_ -eq "defender")} {
+                   if ($EXOAuthRequired) {
+                       $EXOHelperParams = @{
+                           M365Environment = $M365Environment;
+                       }
+                       if ($ServicePrincipalParams) {
+                           $EXOHelperParams += @{ServicePrincipalParams = $ServicePrincipalParams}
+                       }
+                       Write-Verbose "Defender will require a sign in every single run regardless of what the LogIn parameter is set"
+                       Connect-EXOHelper @EXOHelperParams
+                       $EXOAuthRequired = $false
+                   }
+               }
+               "powerplatform" {
+                   if ($AADAuthRequired) {
+                       $LimitedGraphParams = @{
+                           'M365Environment' = $M365Environment;
+                           'ErrorAction' = 'Stop';
+                       }
+                       if ($ServicePrincipalParams) {
+                           $LimitedGraphParams += @{ServicePrincipalParams = $ServicePrincipalParams}
+                       }
+                       Connect-GraphHelper @LimitedGraphParams
+                       $AADAuthRequired = $false
+                   }
+
+                   # Acquire Power Platform access token
+                   $PPScope = Get-PowerPlatformScope -M365Environment $M365Environment
+                   $TokenData.PPBaseUrl = Get-PowerPlatformBaseUrl -M365Environment $M365Environment
+
+                   if ($ServicePrincipalParams.CertThumbprintParams) {
+                       $TokenData.PPAccessToken = Get-MsalAccessToken `
+                           -Scope $PPScope `
+                           -CertificateThumbprint $ServicePrincipalParams.CertThumbprintParams.CertificateThumbprint `
+                           -AppID $ServicePrincipalParams.CertThumbprintParams.AppID `
+                           -Tenant $ServicePrincipalParams.CertThumbprintParams.Organization `
+                           -M365Environment $M365Environment
+                   }
+                   else {
+                       # Interactive - resolve tenant name for authority
+                       $OrgDetails = (Invoke-GraphDirectly -Commandlet Get-MgBetaOrganization -M365Environment $M365Environment).Value
+                       $InitialDomain = $OrgDetails.VerifiedDomains | Where-Object { $_.isInitial }
+                       $TenantName = $InitialDomain.Name
+
+                       # Azure PowerShell well-known client ID
+                       $PPClientId = "1950a258-227b-4e31-a9cf-717495945fc2"
+                       $TokenData.PPAccessToken = Get-MsalAccessToken `
+                           -Scope $PPScope `
+                           -ClientId $PPClientId `
+                           -Tenant $TenantName `
+                           -M365Environment $M365Environment
+                   }
+                   Write-Verbose "Power Platform token acquired successfully"
+               }
+               "sharepoint" {
+                   if ($AADAuthRequired) {
+                       $LimitedGraphParams = @{
+                           'M365Environment' = $M365Environment;
+                           'ErrorAction' = 'Stop';
+                       }
+                       if ($ServicePrincipalParams) {
+                           $LimitedGraphParams += @{ServicePrincipalParams = $ServicePrincipalParams }
+                       }
+                       Connect-GraphHelper @LimitedGraphParams
+                       $AADAuthRequired = $false
+                   }
+                   if ($SPOAuthRequired) {
+                       # Resolve tenant info needed for SharePoint URLs
+                       $OrgDetails = (Invoke-GraphDirectly -Commandlet Get-MgBetaOrganization -M365Environment $M365Environment).Value
+                       $InitialDomain = $OrgDetails.VerifiedDomains | Where-Object { $_.isInitial }
+                       $InitialDomainPrefix = $InitialDomain.Name.split(".")[0]
+                       $TenantName = $InitialDomain.Name
+
+                       $TokenData.SPOAdminUrl = Get-ScubaGearPermissions -Product sharepoint -OutAs endpoint -Environment $M365Environment -Domain $InitialDomainPrefix
+                       $SPOScope = "$($TokenData.SPOAdminUrl)/.default"
+
+                       if ($ServicePrincipalParams.CertThumbprintParams) {
+                           $TokenData.SPOAccessToken = Get-MsalAccessToken `
+                               -Scope $SPOScope `
+                               -CertificateThumbprint $ServicePrincipalParams.CertThumbprintParams.CertificateThumbprint `
+                               -AppID $ServicePrincipalParams.CertThumbprintParams.AppID `
+                               -Tenant $ServicePrincipalParams.CertThumbprintParams.Organization `
+                               -M365Environment $M365Environment
+                       }
+                       else {
+                           # SharePoint Online Management Shell app ID
+                           $SPOClientId = "9bc3ab49-b65d-410a-85ad-de819febfddc"
+                           $TokenData.SPOAccessToken = Get-MsalAccessToken `
+                               -Scope $SPOScope `
+                               -ClientId $SPOClientId `
+                               -Tenant $TenantName `
+                               -M365Environment $M365Environment
+                       }
+                       Write-Verbose "SharePoint token acquired successfully"
+                       $SPOAuthRequired = $false
+                   }
+               }
+               "teams" {
+                   $TeamsParams = @{'ErrorAction'= 'Stop'}
+                   if ($ServicePrincipalParams.CertThumbprintParams) {
+                       $TeamsConnectToTenant = @{
+                           CertificateThumbprint = $ServicePrincipalParams.CertThumbprintParams.CertificateThumbprint;
+                           ApplicationId = $ServicePrincipalParams.CertThumbprintParams.AppID;
+                           TenantId  = $ServicePrincipalParams.CertThumbprintParams.Organization; # Organization Domain is actually required here.
+                       }
+                       $TeamsParams += $TeamsConnectToTenant
+                   }
+                   switch ($M365Environment) {
+                       "gcchigh" {
+                           $TeamsParams += @{'TeamsEnvironmentName'= 'TeamsGCCH';}
+                       }
+                       "dod" {
+                           $TeamsParams += @{'TeamsEnvironmentName'= 'TeamsDOD';}
+                       }
+                   }
+                   Connect-MicrosoftTeams @TeamsParams | Out-Null
+               }
+               default {
+                   throw "Invalid ProductName argument"
+               }
+           }
+       }
+       catch {
+           $ErrorDetails = @{
+               Product = $Product
+               ErrorMessage = $_.Exception.Message
+               ErrorType = $_.Exception.GetType().FullName
+               ScriptStackTrace = $_.ScriptStackTrace
+               TargetObject = if ($_.TargetObject) { $_.TargetObject.ToString() } else { "N/A" }
+           }
+
+           # Log detailed error information for troubleshooting
+           Write-ScubaLog -Message "Authentication failed for product: $Product" -Level "Error" -Source "ConnectTenant" -Data $ErrorDetails
+
+           Write-Warning "Error establishing a connection with $($Product): $($_.Exception.Message)`n$($_.ScriptStackTrace)"
+           $ProdAuthFailed += $Product
+           Write-Warning "$($Product) will be omitted from the output because of failed authentication"
+       }
+   }
+   Write-Progress -Activity "Authenticating to each service" -Status "Ready" -Completed
+
+   # Return connection result with token data for REST-based products
+   @{
+       ProdAuthFailed  = $ProdAuthFailed
+       SPOAccessToken  = $TokenData.SPOAccessToken
+       SPOAdminUrl     = $TokenData.SPOAdminUrl
+       PPAccessToken   = $TokenData.PPAccessToken
+       PPBaseUrl       = $TokenData.PPBaseUrl
+   }
+}
+
+function Disconnect-SCuBATenant {
+   <#
+   .SYNOPSIS
+       Disconnect all active M365 connection sessions made by ScubaGear
+   .DESCRIPTION
+       Forces disconnect of all outstanding open sessions associated with
+       M365 product APIs within the current PowerShell session.
+       Best used after an ScubaGear run to ensure a new tenant connection is
+       used for future ScubaGear runs.
+   .Parameter ProductNames
+   A list of one or more M365 shortened product names this function will disconnect from. By default this function will disconnect from all possible products ScubaGear can run against.
+   .EXAMPLE
+   Disconnect-SCuBATenant
+   .EXAMPLE
+   Disconnect-SCuBATenant -ProductNames teams
+   .EXAMPLE
+   Disconnect-SCuBATenant -ProductNames aad, exo
+   .Functionality
+   Public
+   #>
+   [CmdletBinding()]
+   param(
+       [ValidateSet("aad", "defender", "exo","powerplatform", "sharepoint", "teams", IgnoreCase = $false)]
+       [ValidateNotNullOrEmpty()]
+       [string[]]
+       $ProductNames = @("aad", "defender", "exo", "powerplatform", "sharepoint", "teams")
+   )
+   $ErrorActionPreference = "SilentlyContinue"
+
+   try {
+       $N = 0
+       $Len = $ProductNames.Length
+
+       foreach ($Product in $ProductNames) {
+           $N += 1
+           $Percent = $N*100/$Len
+           Write-Progress -Activity "Disconnecting from each service" -Status "Disconnecting from $($Product); $($n) of $($Len) disconnected." -PercentComplete $Percent
+           Write-Verbose "Disconnecting from $Product."
+           if (($Product -eq "aad") -or ($Product -eq "sharepoint")) {
+               Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+               # SharePoint uses REST API with on-demand token - no persistent connection to disconnect
+           }
+           elseif ($Product -eq "teams") {
+               Disconnect-MicrosoftTeams -Confirm:$false -ErrorAction SilentlyContinue
+           }
+           elseif ($Product -eq "powerplatform") {
+               Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+               # Power Platform uses REST API with on-demand token - no persistent connection to disconnect
+           }
+           elseif (($Product -eq "exo") -or ($Product -eq "defender")) {
+               if($Product -eq "defender") {
+                   Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+               }
+               Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue -InformationAction SilentlyContinue | Out-Null
+           }
+           else {
+               Write-Warning "Product $Product not recognized, skipping..."
+           }
+       }
+       Write-Progress -Activity "Disconnecting from each service" -Status "Done" -Completed
+
+   } catch [System.InvalidOperationException] {
+       # Suppress error due to disconnect from service with no active connection
+       continue
+   } catch {
+       Write-Warning "Could not disconnect from $Product`n: $($_.Exception.Message)`n$($_.ScriptStackTrace)"
+   } finally {
+       $ErrorActionPreference = "Continue"
+   }
+
+}
+
+Export-ModuleMember -Function @(
+   'Connect-Tenant',
+   'Disconnect-SCuBATenant'
+)

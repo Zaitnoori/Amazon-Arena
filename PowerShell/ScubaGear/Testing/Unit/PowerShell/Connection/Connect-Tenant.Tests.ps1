@@ -1,0 +1,82 @@
+Import-Module (Join-Path -Path $PSScriptRoot -ChildPath "../../../../Modules/Connection/Connection.psm1") -Function 'Connect-Tenant' -Force
+
+InModuleScope Connection {
+    Import-Module (Join-Path -Path $PSScriptRoot -ChildPath "../../../../Modules/Permissions/PermissionsHelper.psm1") -Force
+
+    Describe -Tag 'Connection' -Name "Connect-Tenant as <Endpoint>" -ForEach @(
+        @{Endpoint = 'commercial'},
+        @{Endpoint = 'gcc'},
+        @{Endpoint = 'gcchigh'},
+        @{Endpoint = 'dod'}
+    ){
+        BeforeAll {
+            function Connect-GraphHelper {throw 'this will be mocked'}
+            Mock Connect-GraphHelper -MockWith {}
+            # SharePoint now uses REST API - no PnP/SPO connection needed
+            function Connect-MicrosoftTeams{throw 'this will be mocked'}
+            Mock Connect-MicrosoftTeams -MockWith {}
+            function Connect-EXOHelper {throw 'this will be mocked'}
+            Mock -ModuleName Connection Connect-EXOHelper -MockWith {}
+            function Invoke-GraphDirectly {throw 'this will be mocked'}
+            Mock Invoke-GraphDirectly -MockWith {
+                return [pscustomobject]@{
+                    Value = [pscustomobject]@{
+                        DisplayName     = "DisplayName";
+                        Name            = "DomainName";
+                        Id              = "TenantId";
+                        VerifiedDomains = @(
+                            @{ isInitial = $false; Name = "example.onmicrosoft.com" },
+                            @{ isInitial = $true; Name = "contoso.onmicrosoft.com" }
+                        )
+                    }
+                }
+            }
+            function Get-MsalAccessToken {throw 'this will be mocked'}
+            Mock Get-MsalAccessToken -MockWith { return "mock-access-token" }
+            Mock -CommandName Write-Progress {
+            }
+        }
+        Context 'With Endpoint:  <Endpoint>; ProductNames: <ProductNames>' -ForEach @(
+            @{ProductNames = "aad"; Services = @('Connect-GraphHelper')}
+            @{ProductNames = "defender"; Services = @('Connect-EXOHelper')}
+            @{ProductNames = "exo"; Services = @('Connect-EXOHelper')}
+            @{ProductNames = "powerplatform"; Services = @('Connect-GraphHelper')}
+            @{ProductNames = "sharepoint"; Services = @('Connect-GraphHelper')}  # SharePoint uses REST API, only needs Graph for tenant info
+            @{ProductNames = "teams"; Services = @('Connect-MicrosoftTeams')}
+            @{
+                ProductNames = "aad", "defender", "exo", "powerplatform", "sharepoint", "teams"
+                Services = @(
+                    'Connect-GraphHelper',
+                    'Connect-EXOHelper',
+                    'Connect-MicrosoftTeams'
+                )
+            }
+
+        ){
+
+            It "No Service Principal" {
+                $ConnectionResult = Connect-Tenant -ProductNames $ProductNames -M365Environment $Endpoint
+                $ConnectionResult.ProdAuthFailed.Count | Should -Be 0
+            }
+            It "With Service Principal" {
+                $ServicePrincipalParams.CertThumbprintParams.CertificateThumbprint
+                $ServicePrincipalParams =@{
+                    CertThumbprintParams = @{
+                        AppID = "a"
+                        CertificateThumbprint = "b"
+                        Organization = "c"
+                    }
+                }
+                Connect-Tenant -ProductNames $ProductNames -M365Environment $Endpoint -ServicePrincipalParams $ServicePrincipalParams
+                foreach ($Service in $Services){
+                    Should -Invoke -CommandName $Service -Exactly -Times 1 -Because "only want to authenticate to needed service once"
+                }
+            }
+
+        }
+    }
+}
+AfterAll {
+    Remove-Module Connection -ErrorAction SilentlyContinue
+    Remove-Module ConnectHelper -ErrorAction SilentlyContinue
+}
